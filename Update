@@ -1,0 +1,314 @@
+import os
+import json
+import argparse
+import random
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+from joblib import dump
+from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate, RandomizedSearchCV, learning_curve
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc, RocCurveDisplay
+from sklearn.metrics import precision_recall_fscore_support, log_loss
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+import matplotlib.pyplot as plt
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+
+def ensure_dir(p: str) -> Path:
+    path = Path(p)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def load_data(test_size=0.2, seed=42):
+    iris = load_iris()
+    X = pd.DataFrame(iris.data, columns=[c.replace(" (cm)", "") for c in iris.feature_names])
+    y = pd.Series(iris.target, name="target")
+    target_names = iris.target_names.tolist()
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=y, random_state=seed)
+    return X_train, X_test, y_train, y_test, target_names
+
+def get_models():
+    models = {
+        "logreg": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=200, multi_class="auto"))
+        ]),
+        "svm": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", SVC(kernel="rbf", probability=True))
+        ]),
+        "knn": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", KNeighborsClassifier())
+        ]),
+        "rf": Pipeline([
+            ("scaler", MinMaxScaler()),
+            ("clf", RandomForestClassifier())
+        ]),
+        "gb": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", GradientBoostingClassifier())
+        ])
+    }
+    return models
+
+def cv_evaluate(models: dict, X, y, seed=42, cv_splits=5):
+    skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
+    scoring = {
+        "accuracy": "accuracy",
+        "precision_macro": "precision_macro",
+        "recall_macro": "recall_macro",
+        "f1_macro": "f1_macro"
+    }
+    results = {}
+    for name, est in models.items():
+        scores = cross_validate(est, X, y, cv=skf, scoring=scoring, n_jobs=None, return_train_score=True)
+        summary = {k: float(np.mean(v)) for k, v in scores.items()}
+        results[name] = summary
+    return results
+
+def pick_best(results: dict, by="test_f1_macro"):
+    best_name = max(results, key=lambda k: results[k][by])
+    return best_name, results[best_name]
+
+def randomized_search(est_name: str, base_estimator: Pipeline, X, y, seed=42, cv_splits=5, n_iter=25):
+    param_spaces = {
+        "logreg": {
+            "clf__C": np.logspace(-3, 2, 20),
+            "clf__penalty": ["l2"],
+            "clf__solver": ["lbfgs", "liblinear"]
+        },
+        "svm": {
+            "clf__C": np.logspace(-2, 2, 20),
+            "clf__gamma": np.logspace(-4, 0, 20),
+            "clf__kernel": ["rbf"]
+        },
+        "knn": {
+            "clf__n_neighbors": list(range(1, 31)),
+            "clf__weights": ["uniform", "distance"],
+            "clf__p": [1, 2]
+        },
+        "rf": {
+            "clf__n_estimators": list(range(100, 601, 50)),
+            "clf__max_depth": [None] + list(range(2, 21)),
+            "clf__min_samples_split": list(range(2, 11)),
+            "clf__min_samples_leaf": list(range(1, 11))
+        },
+        "gb": {
+            "clf__n_estimators": list(range(50, 401, 25)),
+            "clf__learning_rate": np.linspace(0.01, 0.3, 30),
+            "clf__max_depth": list(range(1, 7)),
+            "clf__subsample": np.linspace(0.6, 1.0, 9)
+        }
+    }
+    skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
+    param_distributions = param_spaces.get(est_name, {})
+    rs = RandomizedSearchCV(
+        estimator=base_estimator,
+        param_distributions=param_distributions,
+        n_iter=n_iter,
+        scoring="f1_macro",
+        n_jobs=None,
+        cv=skf,
+        random_state=seed,
+        verbose=0
+    )
+    rs.fit(X, y)
+    return rs
+
+def probas_and_ovr(estimator: Pipeline, X_train, y_train, X_test, needs_ovr=True):
+    if needs_ovr:
+        ovr = OneVsRestClassifier(estimator)
+        ovr.fit(X_train, y_train)
+        y_proba = ovr.predict_proba(X_test)
+        y_pred = ovr.predict(X_test)
+        return ovr, y_pred, y_proba
+    estimator.fit(X_train, y_train)
+    if hasattr(estimator, "predict_proba"):
+        y_proba = estimator.predict_proba(X_test)
+    else:
+        if hasattr(estimator, "decision_function"):
+            df = estimator.decision_function(X_test)
+            e = np.exp(df - df.max(axis=1, keepdims=True))
+            y_proba = e / e.sum(axis=1, keepdims=True)
+        else:
+            y_proba = None
+    y_pred = estimator.predict(X_test)
+    return estimator, y_pred, y_proba
+
+def plot_roc_multiclass(y_test, y_proba, target_names, out_path: Path):
+    n_classes = len(target_names)
+    y_true_bin = np.zeros((len(y_test), n_classes))
+    for i, cls in enumerate(np.unique(y_test)):
+        y_true_bin[:, i] = (y_test.values == cls).astype(int)
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_proba[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+    fpr["micro"], tpr["micro"], _ = roc_curve(y_true_bin.ravel(), y_proba.ravel())
+    roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+    all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+    mean_tpr = np.zeros_like(all_fpr)
+    for i in range(n_classes):
+        mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+    mean_tpr /= n_classes
+    fpr["macro"] = all_fpr
+    tpr["macro"] = mean_tpr
+    roc_auc["macro"] = auc(fpr["macro"], tpr["macro"])
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr["micro"], tpr["micro"], linestyle="--", label=f"micro-average ROC (AUC = {roc_auc['micro']:.3f})")
+    plt.plot(fpr["macro"], tpr["macro"], linestyle="--", label=f"macro-average ROC (AUC = {roc_auc['macro']:.3f})")
+    for i in range(n_classes):
+        plt.plot(fpr[i], tpr[i], label=f"{target_names[i]} (AUC = {roc_auc[i]:.3f})")
+    plt.plot([0, 1], [0, 1], linestyle=":")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves (Multiclass)")
+    plt.legend(loc="lower right", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    return {target_names[i]: float(roc_auc[i]) for i in range(n_classes)} | {"micro": float(roc_auc["micro"]), "macro": float(roc_auc["macro"])}
+
+def plot_learning_curve(estimator, X, y, out_path: Path, seed=42):
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    train_sizes, train_scores, test_scores = learning_curve(
+        estimator, X, y, cv=cv, scoring="accuracy", n_jobs=None, train_sizes=np.linspace(0.1, 1.0, 8), shuffle=True, random_state=seed
+    )
+    train_mean = train_scores.mean(axis=1)
+    test_mean = test_scores.mean(axis=1)
+    plt.figure(figsize=(8, 6))
+    plt.plot(train_sizes, train_mean, marker="o", label="Training Accuracy")
+    plt.plot(train_sizes, test_mean, marker="s", label="CV Accuracy")
+    plt.xlabel("Training Samples")
+    plt.ylabel("Accuracy")
+    plt.title("Learning Curve")
+    plt.grid(True, linestyle=":", linewidth=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+def plot_confusion_matrix(cm, target_names, out_path: Path):
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm, interpolation="nearest")
+    ax.set_title("Confusion Matrix")
+    tick_marks = np.arange(len(target_names))
+    ax.set_xticks(tick_marks)
+    ax.set_xticklabels(target_names, rotation=45, ha="right")
+    ax.set_yticks(tick_marks)
+    ax.set_yticklabels(target_names)
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], "d"), ha="center", va="center")
+    ax.set_ylabel("True label")
+    ax.set_xlabel("Predicted label")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--test_size", type=float, default=0.2)
+    parser.add_argument("--cv_splits", type=int, default=5)
+    parser.add_argument("--n_iter", type=int, default=30)
+    parser.add_argument("--model", type=str, default="auto", choices=["auto", "logreg", "svm", "knn", "rf", "gb"])
+    parser.add_argument("--calibrate", action="store_true")
+    parser.add_argument("--out_dir", type=str, default="artifacts")
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    out_dir = ensure_dir(args.out_dir)
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = ensure_dir(out_dir / f"run_{run_stamp}")
+
+    X_train, X_test, y_train, y_test, target_names = load_data(test_size=args.test_size, seed=args.seed)
+
+    models = get_models()
+    cv_results = cv_evaluate(models, X_train, y_train, seed=args.seed, cv_splits=args.cv_splits)
+    best_name, best_scores = pick_best(cv_results, by="test_f1_macro") if args.model == "auto" else (args.model, cv_results.get(args.model, {}))
+
+    base_estimator = models[best_name]
+    search = randomized_search(best_name, base_estimator, X_train, y_train, seed=args.seed, cv_splits=args.cv_splits, n_iter=args.n_iter)
+    tuned_estimator = search.best_estimator_
+
+    if args.calibrate:
+        tuned_estimator = CalibratedClassifierCV(tuned_estimator, method="isotonic", cv=args.cv_splits)
+
+    tuned_estimator, y_pred, y_proba = probas_and_ovr(tuned_estimator, X_train, y_train, X_test, needs_ovr=False)
+
+    acc = accuracy_score(y_test, y_pred)
+    pr, rc, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="macro", zero_division=0)
+    report = classification_report(y_test, y_pred, target_names=target_names, zero_division=0)
+    cm = confusion_matrix(y_test, y_pred)
+
+    metrics = {
+        "chosen_model": best_name,
+        "best_params": search.best_params_,
+        "cv_results": cv_results,
+        "cv_best_summary": best_scores,
+        "test_accuracy": float(acc),
+        "test_precision_macro": float(pr),
+        "test_recall_macro": float(rc),
+        "test_f1_macro": float(f1)
+    }
+
+    if y_proba is not None:
+        try:
+            ll = log_loss(y_test, y_proba)
+            metrics["test_log_loss"] = float(ll)
+        except Exception:
+            pass
+
+    model_path = run_dir / f"model_{best_name}.joblib"
+    dump(tuned_estimator, model_path)
+
+    metrics_path = run_dir / "metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    cm_path = run_dir / "confusion_matrix.png"
+    plot_confusion_matrix(cm, target_names, cm_path)
+
+    lc_path = run_dir / "learning_curve.png"
+    plot_learning_curve(models[best_name], pd.concat([X_train, X_test]), pd.concat([y_train, y_test]), lc_path, seed=args.seed)
+
+    roc_path = None
+    roc_auc_dict = None
+    if y_proba is not None:
+        roc_path = run_dir / "roc_multiclass.png"
+        roc_auc_dict = plot_roc_multiclass(y_test, y_proba, target_names, roc_path)
+
+    summary = {
+        "run_dir": str(run_dir.resolve()),
+        "model_file": str(model_path.resolve()),
+        "metrics_file": str(metrics_path.resolve()),
+        "confusion_matrix_file": str(cm_path.resolve()),
+        "learning_curve_file": str(lc_path.resolve()),
+        "roc_file": str(roc_path.resolve()) if roc_path else None,
+        "roc_auc": roc_auc_dict,
+        "target_names": target_names
+    }
+    summary_path = run_dir / "summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+if __name__ == "__main__":
+    main()
